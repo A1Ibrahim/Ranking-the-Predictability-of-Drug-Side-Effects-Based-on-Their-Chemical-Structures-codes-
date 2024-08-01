@@ -1,0 +1,184 @@
+---
+title: "glmnet project"
+author: "Aseel 23115550"
+date: "2024-06-12"
+output: html_document
+---
+
+```{r}
+library(pROC)
+library(rlang)
+library(readr)
+library(rsample)
+library(parsnip)
+library(workflows)
+library(modeldata)
+library(recipes)
+library(glmnet)
+library(tidymodels)
+library(tidyverse)
+library(dplyr)
+library(tidyselect)
+library(caret)
+library(PRROC)
+```
+
+
+```{r}
+# Load data
+drug_chemsfp <- read.delim("~/Downloads/drug_chemsfp.tsv", header = TRUE)
+drug_SIDER <- read.delim2("~/Downloads/drug_SIDER.tsv", header = TRUE)
+
+```
+
+
+
+```{r}
+# Convert to data frame:
+drug_chemsfp <- as.data.frame(drug_chemsfp)
+drug_chemsfp <- na.omit(drug_chemsfp)
+drug_SIDER <- as.data.frame(drug_SIDER)
+drug_SIDER <- na.omit(drug_SIDER)
+
+```
+
+
+```{r}
+# Get common drug names
+common_drug_names <- intersect(drug_chemsfp$X, drug_SIDER$X)
+
+```
+
+```{r}
+# Reorder data based on common drug names
+drug_chemsfp_reordered <- drug_chemsfp[match(common_drug_names, drug_chemsfp$X), ]
+drug_SIDER_reordered <- drug_SIDER[match(common_drug_names, drug_SIDER$X), ]
+
+```
+
+
+```{r}
+# Merge data
+common_raws_FP_SE <- merge(drug_chemsfp_reordered, drug_SIDER_reordered, by = "X")
+common_raws_FP_SE <- as.data.frame(common_raws_FP_SE)
+
+```
+
+
+
+```{r}
+# Clean data
+common_clean <- common_raws_FP_SE[!apply(common_raws_FP_SE, 1, function(row) any(grepl("-", row))), ]
+common_all <- common_clean[!apply(common_clean, 1, function(row) any(grepl("NA", row))), ]
+
+```
+
+
+```{r}
+# Split data into training and testing sets
+set.seed(1122)
+data_split <- initial_split(common_all, prop = 0.8)
+train <- training(data_split)
+test <- testing(data_split)
+
+```
+
+
+```{r}
+# Prepare training data
+side_effect_train <- train[, 1026:7146]
+Y_side_effect_train <- side_effect_train
+
+finger_print_train <- train[, 2:1025]
+X_finger_print_train <- finger_print_train
+X_finger_print_matrix_train <- matrix(as.numeric(unlist(X_finger_print_train)), nrow = nrow(X_finger_print_train), ncol = ncol(X_finger_print_train))
+X_finger_print_matrix_train <- na.omit(X_finger_print_matrix_train)
+
+```
+
+
+```{r}
+# Prepare testing data
+side_effect_test <- test[, 1026:7146]
+Y_side_effect_test <- side_effect_test
+
+finger_print_test <- test[, 2:1025]
+X_finger_print_test <- finger_print_test
+X_finger_print_matrix_test <- matrix(as.numeric(unlist(X_finger_print_test)), nrow = nrow(X_finger_print_test), ncol = ncol(X_finger_print_test))
+X_finger_print_matrix_test <- na.omit(X_finger_print_matrix_test)
+
+```
+
+```{r}
+# Convert side effect to factors:
+Y_side_effect_train <- Y_side_effect_train %>% mutate(across(everything(), ~ as.factor(.)))
+Y_side_effect_test <- Y_side_effect_test %>% mutate(across(everything(), ~ as.factor(.)))
+
+```
+
+```{r}
+# Fit logistic regression model and make predictions for each side effect
+for (i in 1:ncol(Y_side_effect_train)) {
+  side_effect <- colnames(Y_side_effect_train)[i]
+  print(paste("Processing Side Effect:", side_effect))
+  
+  # Prepare response and predictors for training
+  predictors_train <- X_finger_print_train
+  predictors_test <- X_finger_print_test
+  response_test <- Y_side_effect_test[[side_effect]]
+  response_train <- Y_side_effect_train[[side_effect]]
+  
+  # Ensure there are at least two level in both training and test sets
+  if (length(unique(response_train)) < 2 || length(unique(response_test)) < 2) {
+    print(paste("Skipping Side Effect:", side_effect, "- only one level present in training or test data"))
+    next
+  }
+  
+    # Ensure there are at least 8 observations in each class in the training data
+  if (any(table(response_train) < 8)) {
+    print(paste("Skipping Side Effect:", side_effect, "- fewer than 8 observations in one class"))
+    next
+  }
+  
+  
+  # Convert responses to numeric :
+  response_train <- as.numeric(as.character(response_train))
+  response_test <- as.numeric(as.character(response_test))
+  
+  # Convert predictors to matrix:
+  predictors_train <- as.matrix(predictors_train)
+  predictors_test <- as.matrix(predictors_test)
+  
+  # Fit logistic regression model 
+  cv_model <- cv.glmnet(predictors_train, response_train, family = "binomial", alpha = 1)
+  best_lambda <- cv_model$lambda.min
+  glmnet_model <- glmnet(predictors_train, response_train, family = "binomial", alpha = 1, lambda = best_lambda)
+  
+  # Make predictions on test set
+  predictions <- predict(glmnet_model, newx = predictors_test, type = "response")
+  predictions <- as.vector(predictions)
+  
+  # Calculate the ROC for side effect that has 2 levels in the test data
+  roc_obj <- roc(response_test, predictions)
+  roc_auc <- auc(roc_obj)
+  print(paste("ROC AUC for", side_effect, ":", roc_auc))
+  
+   # calculate the PR for the side effect that has 2 level in the test data:
+      pr_curve_obj <- tryCatch({
+    pr.curve(scores.class0 = predictions[response_test == 0], 
+             scores.class1 = predictions[response_test == 1], 
+             curve = TRUE)
+  }, error = function(e) {
+    print(paste("Error in PR curve calculation for", side_effect))
+    return(NULL)
+  })
+  
+  if (!is.null(pr_curve_obj)) {
+    print(paste("PR AUC for", side_effect, ":", pr_curve_obj$auc.integral))
+  }
+}
+
+
+
+```
+
